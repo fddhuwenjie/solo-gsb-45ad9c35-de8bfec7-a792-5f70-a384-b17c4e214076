@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .knockout import MAX_GROUPS as KNOCKOUT_MAX_GROUPS
 from .scheduling import MAX_ROUNDS, MAX_TEAMS
 
 
@@ -216,3 +217,68 @@ class RoundRobinScheduleResponse(BaseModel):
     teams: list[str]
     rounds: int
     schedule: list[ScheduleRound]
+
+
+class KnockoutGroupIn(BaseModel):
+    """One round-robin group: its table, completed matches and slots."""
+
+    group_id: str = Field(min_length=1, examples=["A"])
+    teams: list[str] = Field(min_length=1, examples=[["a1", "a2", "a3"]])
+    matches: list[MatchIn] = Field(default_factory=list)
+    qualify_slots: int = Field(
+        ge=1,
+        description=(
+            "Number of teams advancing from this group (the top teams of "
+            "the recursively tie-broken group table)."
+        ),
+        examples=[2],
+    )
+
+
+class PlayedCrossGroupPairIn(BaseModel):
+    """A cross-group matchup that already happened (unordered pair)."""
+
+    home: str = Field(min_length=1, examples=["a1"])
+    away: str = Field(min_length=1, examples=["b1"])
+
+
+class KnockoutFirstRoundRequest(BaseModel):
+    """Groups, their qualification slots and played cross-group pairs."""
+
+    groups: list[KnockoutGroupIn] = Field(
+        min_length=2,
+        max_length=KNOCKOUT_MAX_GROUPS,
+    )
+    played_pairs: list[PlayedCrossGroupPairIn] = Field(default_factory=list)
+
+
+class SeededTeamOut(BaseModel):
+    """One qualified team: its seed number, group and in-group rank."""
+
+    seed: int
+    team: str
+    group_id: str
+    group_rank: int
+
+
+class KnockoutPairingOut(BaseModel):
+    """One first-round fixture with the constraints it was built under.
+
+    Team ids within a pair are ordered lexicographically; the pair list
+    is itself sorted lexicographically by (team_a, team_b).
+    """
+
+    team_a: str
+    team_b: str
+    seed_a: int
+    seed_b: int
+    group_a: str
+    group_b: str
+    constraints: list[str]
+
+
+class KnockoutFirstRoundResponse(BaseModel):
+    """Seeds (in seed order) and the first-round pairings."""
+
+    seeds: list[SeededTeamOut]
+    pairings: list[KnockoutPairingOut]

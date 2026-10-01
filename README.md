@@ -1,6 +1,6 @@
 # 循环赛积分榜 API
 
-基于 FastAPI 的循环赛（round-robin）服务。提交参赛队伍与已完赛比分，返回排名及各项统计数据；也可让服务返回一棵**可机读的排名判定树**，说明每一层同分判定是如何分出先后的；也可提交未赛对阵的候选比分，枚举所有赛果组合，分析各队跻身前 K 名的出线形势；还可提交队伍数、总轮数、各队不可参赛轮次和固定比赛，生成满足主客场均衡与连场限制的单循环赛程。
+基于 FastAPI 的循环赛（round-robin）服务。提交参赛队伍与已完赛比分，返回排名及各项统计数据；也可让服务返回一棵**可机读的排名判定树**，说明每一层同分判定是如何分出先后的；也可提交未赛对阵的候选比分，枚举所有赛果组合，分析各队跻身前 K 名的出线形势；还可提交队伍数、总轮数、各队不可参赛轮次和固定比赛，生成满足主客场均衡与连场限制的单循环赛程。最后还可提交 2～8 个**分组**及其晋级名额与已发生的跨组对阵，服务按同一套排名规则确定每组名次，并生成跨组、不重赛、种子号差值总和最小的淘汰赛首轮配对。
 
 ## 排名规则
 
@@ -22,6 +22,8 @@
 - 未赛对阵的候选比分为空或含负数
 - `top_k` 小于 1
 - 候选比分组合数超过 100000
+- 跨组淘汰赛：分组数不在 2～8、组 ID 重复或为空、队伍 ID 跨组重复、晋级名额超出本组队数、`played_pairs` 出现未知队伍/自对阵/重复对阵
+- 跨组淘汰赛：晋级队总数不是 4～16 之间的 2 的幂，或不存在任何满足约束的完美配对（返回 422）
 
 ## 赛程生成（POST /round-robin-schedules）
 
@@ -69,6 +71,7 @@ uvicorn app.main:app --reload
 - 排名判定树端点：`POST http://localhost:8000/standings/explanation`
 - 出线形势端点：`POST http://localhost:8000/qualification-scenarios`
 - 赛程生成端点：`POST http://localhost:8000/round-robin-schedules`
+- 跨组淘汰赛首轮配对端点：`POST http://localhost:8000/knockout-first-round`
 - Swagger 交互文档：`http://localhost:8000/docs`
 - OpenAPI 规范：`http://localhost:8000/openapi.json`
 
@@ -331,6 +334,88 @@ curl -X POST http://localhost:8000/round-robin-schedules \
 
 固定比赛 `delta`（主）对 `alpha`（客）保留在第 1 轮；`alpha` 不在第 3 轮出赛；每队均为 2 主 2 客（或主客差 1），且不存在连续三场同主或同客。
 
+## 跨组淘汰赛首轮配对（POST /knockout-first-round）
+
+提交 **2～8 个分组**，每个分组给出：
+
+- `group_id`：分组 ID；
+- `teams`、`matches`：该组的队伍与已完赛比赛（结构与 `/standings` 相同，校验规则也一致）；
+- `qualify_slots`：本组晋级名额（1～本组队数）。
+
+此外给出 `played_pairs`：已经发生的**跨组对阵**（无序队对，`home`/`away` 仅用于给出两队）。
+
+### 名次与种子
+
+服务先按与 `/standings` **完全相同的递归同分规则**排出每组名次，取各组前 `qualify_slots` 名，共得到 **4～16 支、且为 2 的幂**的晋级队。晋级队按 `(组内名次, group_id, 队伍 ID)` 升序编号为种子 1…N。
+
+### 配对约束与最优性
+
+首轮是晋级队的一个**完美配对**（每队恰好出现一次），并满足：
+
+- `different_group`：对阵双方不得同组；
+- `no_replay`：不得重赛，即不得与 `played_pairs` 中的跨组对阵重复（主客互换也算重赛）。
+
+在所有可行完美配对中，返回**双方种子号差值之和最小**的方案；若多个方案并列，再按「配对内队伍 ID 字典序排列后，整个配对列表的字典序」取唯一结果，因此同一请求始终返回同一响应。每场配对都会在 `constraints` 中列出它所采用的约束（固定为 `["different_group", "no_replay"]`）。`seeds` 按种子号排序，`pairings` 按 `(team_a, team_b)` 字典序排序。
+
+晋级队总数不是 4～16 之间的 2 的幂，或不存在可行完美配对时返回 `422`。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/knockout-first-round \
+  -H "Content-Type: application/json" \
+  -d '{
+    "groups": [
+      {
+        "group_id": "A",
+        "teams": ["a1", "a2", "a3"],
+        "matches": [
+          {"home": "a1", "away": "a2", "home_score": 2, "away_score": 0},
+          {"home": "a2", "away": "a3", "home_score": 1, "away_score": 1},
+          {"home": "a1", "away": "a3", "home_score": 0, "away_score": 0}
+        ],
+        "qualify_slots": 2
+      },
+      {
+        "group_id": "B",
+        "teams": ["b1", "b2", "b3"],
+        "matches": [
+          {"home": "b1", "away": "b2", "home_score": 2, "away_score": 0},
+          {"home": "b2", "away": "b3", "home_score": 1, "away_score": 1},
+          {"home": "b1", "away": "b3", "home_score": 0, "away_score": 0}
+        ],
+        "qualify_slots": 2
+      }
+    ],
+    "played_pairs": [
+      {"home": "a1", "away": "b1"}
+    ]
+  }'
+```
+
+组内名次为 a1（4 分）、a3（2 分）、a2（1 分），B 组同理；因此种子依次是 a1、b1（各组头名），再是 a3、b3（各组次名）。a1 与 b1 已跨组交手（`no_replay`），相邻种子 a1-a3、b1-b3 又会同组相遇（`different_group`），故最优可行配对为交叉配对，种子号差值总和为 4：
+
+```json
+{
+  "seeds": [
+    {"seed": 1, "team": "a1", "group_id": "A", "group_rank": 1},
+    {"seed": 2, "team": "b1", "group_id": "B", "group_rank": 1},
+    {"seed": 3, "team": "a3", "group_id": "A", "group_rank": 2},
+    {"seed": 4, "team": "b3", "group_id": "B", "group_rank": 2}
+  ],
+  "pairings": [
+    {"team_a": "a1", "team_b": "b3", "seed_a": 1, "seed_b": 4,
+     "group_a": "A", "group_b": "B",
+     "constraints": ["different_group", "no_replay"]},
+    {"team_a": "a3", "team_b": "b1", "seed_a": 3, "seed_b": 2,
+     "group_a": "A", "group_b": "B",
+     "constraints": ["different_group", "no_replay"]}
+  ]
+}
+```
+
+若删掉 `played_pairs`，则不受重赛限制，最优配对为相邻种子 `(a1, b1)` 与 `(a3, b3)`，差值总和为 2。若总晋级数为 6（例如名额 3+2，不是 2 的幂），或某队所有可行对手均已同组/重赛而无完美配对，服务返回 `422` 并说明原因。
+
 ## 运行测试
 
 ```bash
@@ -347,11 +432,13 @@ app/
   standings.py   # 积分榜计算与校验逻辑
   scenarios.py   # 出线形势枚举与名次极值计算
   scheduling.py  # 单循环赛程生成与可行性回溯
+  knockout.py    # 跨组淘汰赛首轮种子编号与最优完美配对
 tests/
   test_standings.py
   test_standings_explanation.py
   test_scenarios.py
   test_schedules.py
+  test_knockout.py
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -4,10 +4,17 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .knockout import (
+    KnockoutValidationError,
+    compute_knockout_first_round,
+)
 from .scenarios import compute_scenarios
 from .schemas import (
     DecisionPartitionOut,
     FinalVerdictRowOut,
+    KnockoutFirstRoundRequest,
+    KnockoutFirstRoundResponse,
+    KnockoutPairingOut,
     MatchIn,
     MiniLeagueRowOut,
     PointsGroupOut,
@@ -19,6 +26,7 @@ from .schemas import (
     ScenarioEntry,
     ScheduledMatchOut,
     ScheduleRound,
+    SeededTeamOut,
     StandingEntry,
     StandingsExplanationResponse,
     StandingsRequest,
@@ -35,7 +43,7 @@ from .standings import (
 
 app = FastAPI(
     title="Round-Robin Standings API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Compute a round-robin league table from completed matches. "
         "Win = 3 points, draw = 1. Ties are broken by head-to-head "
@@ -51,7 +59,10 @@ app = FastAPI(
         "POST /round-robin-schedules generates the lexicographically "
         "smallest feasible single round-robin schedule that respects "
         "unavailable rounds, fixed matches, home/away balance and the "
-        "no-three-consecutive-games-on-one-side rule."
+        "no-three-consecutive-games-on-one-side rule. "
+        "POST /knockout-first-round ranks 2-8 groups with the same "
+        "rules, seeds their qualifiers and builds the seed-difference "
+        "minimal cross-group first-round matching with no replays."
     ),
 )
 
@@ -59,6 +70,13 @@ app = FastAPI(
 @app.exception_handler(StandingsValidationError)
 async def standings_validation_handler(
     request: Request, exc: StandingsValidationError
+) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(KnockoutValidationError)
+async def knockout_validation_handler(
+    request: Request, exc: KnockoutValidationError
 ) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
@@ -286,4 +304,53 @@ def post_round_robin_schedule(
         teams=list(payload.teams),
         rounds=payload.rounds,
         schedule=rounds,
+    )
+
+
+@app.post(
+    "/knockout-first-round",
+    response_model=KnockoutFirstRoundResponse,
+    responses={422: {"description": "Invalid groups/pairs, non-power-of-two field or no feasible pairing"}},
+)
+def post_knockout_first_round(
+    payload: KnockoutFirstRoundRequest,
+) -> KnockoutFirstRoundResponse:
+    """Build the cross-group first-round pairing of the qualifiers.
+
+    Each group is ranked with the same recursive tie-breaking rules as
+    /standings and its top ``qualify_slots`` teams advance. Qualifiers
+    are seeded by (in-group rank, group id, team id) and paired into a
+    perfect matching: every team plays exactly once, never against a
+    team from its own group and never repeating a pair listed in
+    ``played_pairs``. Among all feasible matchings the one minimizing
+    the sum of the two sides' seed differences is returned, breaking
+    ties by the lexicographically smallest pairing list. A qualified
+    field that is not a power of two between 4 and 16, or the absence
+    of any feasible matching, yields 422.
+    """
+    seeded, pairings = compute_knockout_first_round(
+        payload.groups, payload.played_pairs
+    )
+    return KnockoutFirstRoundResponse(
+        seeds=[
+            SeededTeamOut(
+                seed=entry.seed,
+                team=entry.team,
+                group_id=entry.group_id,
+                group_rank=entry.group_rank,
+            )
+            for entry in seeded
+        ],
+        pairings=[
+            KnockoutPairingOut(
+                team_a=pairing.team_a,
+                team_b=pairing.team_b,
+                seed_a=pairing.seed_a,
+                seed_b=pairing.seed_b,
+                group_a=pairing.group_a,
+                group_b=pairing.group_b,
+                constraints=list(pairing.constraints),
+            )
+            for pairing in pairings
+        ],
     )
