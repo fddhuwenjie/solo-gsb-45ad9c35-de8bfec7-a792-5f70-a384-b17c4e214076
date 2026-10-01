@@ -5,9 +5,21 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .scenarios import compute_scenarios
+from .knockout import (
+    RULE_DIFFERENT_GROUP,
+    RULE_NO_REPLAY,
+    KnockoutValidationError,
+    compute_knockout_pairings,
+)
 from .schemas import (
     DecisionPartitionOut,
     FinalVerdictRowOut,
+    GroupQualifierOut,
+    KnockoutGroupOut,
+    KnockoutMatchOut,
+    KnockoutPairingRequest,
+    KnockoutPairingResponse,
+    MatchConstraintOut,
     MatchIn,
     MiniLeagueRowOut,
     PointsGroupOut,
@@ -19,6 +31,7 @@ from .schemas import (
     ScenarioEntry,
     ScheduledMatchOut,
     ScheduleRound,
+    SeedOut,
     StandingEntry,
     StandingsExplanationResponse,
     StandingsRequest,
@@ -35,7 +48,7 @@ from .standings import (
 
 app = FastAPI(
     title="Round-Robin Standings API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Compute a round-robin league table from completed matches. "
         "Win = 3 points, draw = 1. Ties are broken by head-to-head "
@@ -51,7 +64,11 @@ app = FastAPI(
         "POST /round-robin-schedules generates the lexicographically "
         "smallest feasible single round-robin schedule that respects "
         "unavailable rounds, fixed matches, home/away balance and the "
-        "no-three-consecutive-games-on-one-side rule."
+        "no-three-consecutive-games-on-one-side rule. "
+        "POST /knockout-pairings ranks 2-8 finished groups with the same "
+        "recursive tie-break rules, seeds the advancing teams and builds "
+        "the seed-difference-minimal first-round perfect matching with "
+        "no same-group meetings and no replays."
     ),
 )
 
@@ -66,6 +83,13 @@ async def standings_validation_handler(
 @app.exception_handler(ScheduleValidationError)
 async def schedule_validation_handler(
     request: Request, exc: ScheduleValidationError
+) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(KnockoutValidationError)
+async def knockout_validation_handler(
+    request: Request, exc: KnockoutValidationError
 ) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
@@ -286,4 +310,106 @@ def post_round_robin_schedule(
         teams=list(payload.teams),
         rounds=payload.rounds,
         schedule=rounds,
+    )
+
+
+@app.post(
+    "/knockout-pairings",
+    response_model=KnockoutPairingResponse,
+    responses={
+        422: {
+            "description": (
+                "Invalid groups or pairs, advancing count not a power of "
+                "two in 4..16, or no feasible first-round pairing"
+            )
+        }
+    },
+)
+def post_knockout_pairings(
+    payload: KnockoutPairingRequest,
+) -> KnockoutPairingResponse:
+    """Build the optimal cross-group knockout first-round pairing.
+
+    Each group is ranked with the same recursive head-to-head rules as
+    /standings; its top ``qualifiers`` teams advance. The advancers are
+    seeded by (group rank, group id, team id). The first round is a
+    perfect matching in which every team plays exactly once, two teams
+    from the same group never meet and no pair from ``played_pairs`` is
+    replayed. Among all feasible matchings the minimum total of paired
+    seed-number differences is returned; ties are broken by the
+    lexicographically smallest sorted list of paired team ids.
+    """
+    plan = compute_knockout_pairings(payload.groups, payload.played_pairs)
+
+    matches = []
+    for match in plan.matches:
+        incident = [
+            tuple(sorted((entry.team_a, entry.team_b)))
+            for entry in payload.played_pairs
+            if match.team_a in (entry.team_a, entry.team_b)
+            or match.team_b in (entry.team_a, entry.team_b)
+        ]
+        incident.sort()
+        if incident:
+            replay_detail = (
+                "this pair is not among the already played cross-group "
+                "pairs incident on its teams: "
+                + ", ".join(f"{a}/{b}" for a, b in incident)
+            )
+        else:
+            replay_detail = (
+                "neither side has played a cross-group match before, so "
+                "this pair is not a replay"
+            )
+        matches.append(
+            KnockoutMatchOut(
+                team_a=match.team_a,
+                team_b=match.team_b,
+                seed_a=match.seed_a,
+                seed_b=match.seed_b,
+                group_a=match.group_a,
+                group_b=match.group_b,
+                seed_difference=match.seed_difference,
+                constraints=[
+                    MatchConstraintOut(
+                        rule=RULE_DIFFERENT_GROUP,
+                        detail=(
+                            f"'{match.team_a}' (group {match.group_a}) and "
+                            f"'{match.team_b}' (group {match.group_b}) come "
+                            "from different groups"
+                        ),
+                        involved_pairs=[],
+                    ),
+                    MatchConstraintOut(
+                        rule=RULE_NO_REPLAY,
+                        detail=replay_detail,
+                        involved_pairs=[[a, b] for a, b in incident],
+                    ),
+                ],
+            )
+        )
+    return KnockoutPairingResponse(
+        advancing_teams=len(plan.seeds),
+        seed_difference_sum=plan.seed_difference_sum,
+        played_pair_count=plan.played_pair_count,
+        groups=[
+            KnockoutGroupOut(
+                group_id=group.group_id,
+                qualifiers=[
+                    GroupQualifierOut(group_rank=rank, team=team)
+                    for rank, team in group.qualifiers
+                ],
+            )
+            for group in plan.groups
+        ],
+        seeds=[
+            SeedOut(
+                seed=seed.seed,
+                team=seed.team,
+                group_id=seed.group_id,
+                group_rank=seed.group_rank,
+            )
+            for seed in plan.seeds
+        ],
+        matches=matches,
     )

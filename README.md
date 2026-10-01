@@ -1,6 +1,6 @@
 # 循环赛积分榜 API
 
-基于 FastAPI 的循环赛（round-robin）服务。提交参赛队伍与已完赛比分，返回排名及各项统计数据；也可让服务返回一棵**可机读的排名判定树**，说明每一层同分判定是如何分出先后的；也可提交未赛对阵的候选比分，枚举所有赛果组合，分析各队跻身前 K 名的出线形势；还可提交队伍数、总轮数、各队不可参赛轮次和固定比赛，生成满足主客场均衡与连场限制的单循环赛程。
+基于 FastAPI 的循环赛（round-robin）服务。提交参赛队伍与已完赛比分，返回排名及各项统计数据；也可让服务返回一棵**可机读的排名判定树**，说明每一层同分判定是如何分出先后的；也可提交未赛对阵的候选比分，枚举所有赛果组合，分析各队跻身前 K 名的出线形势；还可提交队伍数、总轮数、各队不可参赛轮次和固定比赛，生成满足主客场均衡与连场限制的单循环赛程；还可提交 2～8 个已赛完的分组及其晋级名额与已发生的跨组对阵，为淘汰赛首轮生成**不同组、不重赛、种子差最小**的完美配对。
 
 ## 排名规则
 
@@ -39,6 +39,27 @@
 
 `unavailability` 为列表，每项含 `team` 与 `unavailable_rounds`（1 起始的轮次号）。`fixed_matches` 每项含 `home`、`away`、`round`。固定比赛与不可参赛轮次冲突、同轮重复使用同一支队伍、重复对阵或自对阵均返回 `422`；约束无法同时满足（无可行赛程）时也返回 `422` 并说明原因。
 
+## 跨组淘汰赛首轮配对（POST /knockout-pairings）
+
+提交 2～8 个**已赛完的分组**，每组给出 `group_id`、`teams`、组内已赛 `matches` 与晋级名额 `qualifiers`，另可给出已发生的跨组对阵 `played_pairs`（每项 `team_a`、`team_b`）。
+
+处理流程：
+
+1. 每组都按与 `/standings` 完全相同的**递归同分排名规则**确定名次，取各组前 `qualifiers` 名晋级。
+2. 晋级队总数必须是 **4～16 之间的 2 的幂**（即 4、8、16），否则 `422`。
+3. 晋级队按 **（组内名次、group_id、队伍 ID）** 排序，依次编号为种子 1…N。
+4. 在所有可行的完美配对（首轮每队恰好一次、**不同组**、**不重赛**任何 `played_pairs`）中，返回**双方种子号差值总和最小**的方案；若有多组最优，按各场两队 ID 排序后组成的列表取**字典序最小**，因此结果唯一。
+5. 无解（每种完美配对都必然同组相遇或重赛）时返回 `422`。
+
+响应给出每组晋级队 `groups`、完整种子表 `seeds`、每场配对 `matches`（含双方种子、所属组、种子差及该场采用的约束）与总种子差 `seed_difference_sum`。每场的 `constraints` 恒含两条：
+
+- `different_group`：两队来自不同分组；
+- `no_replay`：该场不是重赛；`involved_pairs` 列出与本场任一队相关、已发生的跨组对阵（可能为空），配对本身一定不在其中。
+
+### 校验规则
+
+以下情况返回 `422`：分组数不在 2～8；`group_id` 为空或重复；某组无队伍、队伍 ID 重复或同一队出现在多个组；`qualifiers` 不在 1～该组队伍数范围内；组内 `matches` 触发与 `/standings` 相同的校验错误；`played_pairs` 出现未知队伍、自对阵、同组对阵或重复；晋级队总数不是 4～16 的 2 的幂；不存在可行完美配对。
+
 ## 启动方式
 
 ### Docker Compose（推荐）
@@ -69,6 +90,7 @@ uvicorn app.main:app --reload
 - 排名判定树端点：`POST http://localhost:8000/standings/explanation`
 - 出线形势端点：`POST http://localhost:8000/qualification-scenarios`
 - 赛程生成端点：`POST http://localhost:8000/round-robin-schedules`
+- 淘汰赛配对端点：`POST http://localhost:8000/knockout-pairings`
 - Swagger 交互文档：`http://localhost:8000/docs`
 - OpenAPI 规范：`http://localhost:8000/openapi.json`
 
@@ -331,6 +353,84 @@ curl -X POST http://localhost:8000/round-robin-schedules \
 
 固定比赛 `delta`（主）对 `alpha`（客）保留在第 1 轮；`alpha` 不在第 3 轮出赛；每队均为 2 主 2 客（或主客差 1），且不存在连续三场同主或同客。
 
+### POST /knockout-pairings
+
+四个小组各取头名（共 4 支晋级队，种子 1～4），且 `a1` 与 `b1` 已在跨组比赛中交手，因此首轮不会重赛：
+
+```bash
+curl -X POST http://localhost:8000/knockout-pairings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "groups": [
+      {"group_id": "A", "teams": ["a1", "a2"], "qualifiers": 1,
+       "matches": [{"home": "a1", "away": "a2", "home_score": 1, "away_score": 0}]},
+      {"group_id": "B", "teams": ["b1", "b2"], "qualifiers": 1,
+       "matches": [{"home": "b1", "away": "b2", "home_score": 2, "away_score": 1}]},
+      {"group_id": "C", "teams": ["c1", "c2"], "qualifiers": 1,
+       "matches": [{"home": "c2", "away": "c1", "home_score": 0, "away_score": 1}]},
+      {"group_id": "D", "teams": ["d1", "d2"], "qualifiers": 1,
+       "matches": [{"home": "d1", "away": "d2", "home_score": 3, "away_score": 0}]}
+    ],
+    "played_pairs": [{"team_a": "a1", "team_b": "b1"}]
+  }'
+```
+
+`a1-b1` 已赛，最小种子差 2 的相邻配对 `(a1,b1)+(c1,d1)` 不可行；两组种子差总和均为 4 的方案中，按配对队伍 ID 字典序选取含 `(a1,c1)` 的一组。响应：
+
+```json
+{
+  "advancing_teams": 4,
+  "seed_difference_sum": 4,
+  "played_pair_count": 1,
+  "groups": [
+    {"group_id": "A", "qualifiers": [{"group_rank": 1, "team": "a1"}]},
+    {"group_id": "B", "qualifiers": [{"group_rank": 1, "team": "b1"}]},
+    {"group_id": "C", "qualifiers": [{"group_rank": 1, "team": "c1"}]},
+    {"group_id": "D", "qualifiers": [{"group_rank": 1, "team": "d1"}]}
+  ],
+  "seeds": [
+    {"seed": 1, "team": "a1", "group_id": "A", "group_rank": 1},
+    {"seed": 2, "team": "b1", "group_id": "B", "group_rank": 1},
+    {"seed": 3, "team": "c1", "group_id": "C", "group_rank": 1},
+    {"seed": 4, "team": "d1", "group_id": "D", "group_rank": 1}
+  ],
+  "matches": [
+    {
+      "team_a": "a1", "team_b": "c1",
+      "seed_a": 1, "seed_b": 3, "group_a": "A", "group_b": "C",
+      "seed_difference": 2,
+      "constraints": [
+        {"rule": "different_group",
+         "detail": "'a1' (group A) and 'c1' (group C) come from different groups",
+         "involved_pairs": []},
+        {"rule": "no_replay",
+         "detail": "this pair is not among the already played cross-group pairs incident on its teams: a1/b1",
+         "involved_pairs": [["a1", "b1"]]}
+      ]
+    },
+    {
+      "team_a": "b1", "team_b": "d1",
+      "seed_a": 2, "seed_b": 4, "group_a": "B", "group_b": "D",
+      "seed_difference": 2,
+      "constraints": [
+        {"rule": "different_group",
+         "detail": "'b1' (group B) and 'd1' (group D) come from different groups",
+         "involved_pairs": []},
+        {"rule": "no_replay",
+         "detail": "this pair is not among the already played cross-group pairs incident on its teams: a1/b1",
+         "involved_pairs": [["a1", "b1"]]}
+      ]
+    }
+  ]
+}
+```
+
+无可行配对时（例如某队已与其余所有晋级队跨组交手）返回 `422`：
+
+```json
+{"detail": "no feasible first-round pairing exists: every perfect matching either pairs two teams from the same group or replays a played cross-group pair"}
+```
+
 ## 运行测试
 
 ```bash
@@ -347,11 +447,13 @@ app/
   standings.py   # 积分榜计算与校验逻辑
   scenarios.py   # 出线形势枚举与名次极值计算
   scheduling.py  # 单循环赛程生成与可行性回溯
+  knockout.py    # 跨组淘汰赛首轮种子配对（子集 DP + 字典序重建）
 tests/
   test_standings.py
   test_standings_explanation.py
   test_scenarios.py
   test_schedules.py
+  test_knockout.py
 Dockerfile
 docker-compose.yml
 requirements.txt

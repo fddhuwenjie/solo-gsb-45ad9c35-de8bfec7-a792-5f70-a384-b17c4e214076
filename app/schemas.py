@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .knockout import MAX_GROUPS, MAX_QUALIFIED, MIN_GROUPS
 from .scheduling import MAX_ROUNDS, MAX_TEAMS
 
 
@@ -216,3 +217,96 @@ class RoundRobinScheduleResponse(BaseModel):
     teams: list[str]
     rounds: int
     schedule: list[ScheduleRound]
+
+
+class KnockoutGroupIn(BaseModel):
+    """One completed round-robin group and its number of qualifiers."""
+
+    group_id: str = Field(min_length=1, examples=["A"])
+    teams: list[str] = Field(min_length=1, examples=[["alpha", "bravo"]])
+    matches: list[MatchIn] = Field(default_factory=list)
+    qualifiers: int = Field(
+        ge=1,
+        le=MAX_QUALIFIED,
+        description="Number of teams advancing from this group.",
+        examples=[2],
+    )
+
+
+class PlayedPairIn(BaseModel):
+    """One cross-group matchup that has already taken place."""
+
+    team_a: str = Field(min_length=1, examples=["alpha"])
+    team_b: str = Field(min_length=1, examples=["charlie"])
+
+
+class KnockoutPairingRequest(BaseModel):
+    """2-8 finished groups, their slots and the played cross-group pairs."""
+
+    groups: list[KnockoutGroupIn] = Field(
+        min_length=MIN_GROUPS,
+        max_length=MAX_GROUPS,
+    )
+    played_pairs: list[PlayedPairIn] = Field(default_factory=list)
+
+
+class GroupQualifierOut(BaseModel):
+    """One advancing team within its group (by group-rank order)."""
+
+    group_rank: int
+    team: str
+
+
+class KnockoutGroupOut(BaseModel):
+    """The teams advancing from one group."""
+
+    group_id: str
+    qualifiers: list[GroupQualifierOut]
+
+
+class SeedOut(BaseModel):
+    """One seeded advancing team."""
+
+    seed: int
+    team: str
+    group_id: str
+    group_rank: int
+
+
+class MatchConstraintOut(BaseModel):
+    """One pairing rule applied to a knockout match.
+
+    - ``different_group``: the two teams come from different groups.
+    - ``no_replay``: the pair is not in ``played_pairs``.
+      ``involved_pairs`` lists the already played cross-group pairs
+      incident on either side of this match (possibly empty); the
+      scheduled pair itself is always absent from that list.
+    """
+
+    rule: Literal["different_group", "no_replay"]
+    detail: str
+    involved_pairs: list[tuple[str, str]]
+
+
+class KnockoutMatchOut(BaseModel):
+    """One first-round pairing (team ids sorted lexicographically)."""
+
+    team_a: str
+    team_b: str
+    seed_a: int
+    seed_b: int
+    group_a: str
+    group_b: str
+    seed_difference: int
+    constraints: list[MatchConstraintOut]
+
+
+class KnockoutPairingResponse(BaseModel):
+    """The seeds and the unique optimal first-round pairing."""
+
+    advancing_teams: int
+    seed_difference_sum: int
+    played_pair_count: int
+    groups: list[KnockoutGroupOut]
+    seeds: list[SeedOut]
+    matches: list[KnockoutMatchOut]
